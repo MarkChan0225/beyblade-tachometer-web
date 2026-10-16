@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#10131a">
+  <title>Beyblade Tachometer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div>
+        <p class="eyebrow">ESP32-S3 / ITR1113</p>
+        <h1>Beyblade Tachometer</h1>
+      </div>
+      <button id="connectButton" class="primary">Connect</button>
+    </header>
+
+    <p id="message" class="message">Connect to your tachometer over Bluetooth.</p>
+
+    <section class="metrics">
+      <article><span>Current RPM</span><strong id="currentRpm">0</strong></article>
+      <article><span>Peak RPM</span><strong id="peakRpm">0</strong></article>
+      <article><span>Top RPM</span><strong id="topRpm">0</strong></article>
+      <article><span>Battery</span><strong id="batteryValue">-</strong></article>
+    </section>
+
+    <section class="card">
+      <div class="section-title"><h2>Sensor test</h2><span id="state" class="pill">Disconnected</span></div>
+      <div class="sensor-readout"><strong id="sensorValue">0</strong><span id="sensorState">-</span></div>
+      <div class="bar"><i id="sensorBar"></i></div>
+      <p class="hint">Move the ITR1113 over white and black surfaces while watching the ADC value.</p>
+      <label class="switch"><input id="sensorTest" type="checkbox"><span></span> Sensor test mode</label>
+    </section>
+
+    <section class="card">
+      <div class="section-title"><h2>Thresholds</h2><button id="saveSettings" class="small">Save</button></div>
+      <label>High threshold <output id="highOutput">70%</output><input id="high" type="range" min="1" max="99" value="70"></label>
+      <label>Low threshold <output id="lowOutput">30%</output><input id="low" type="range" min="0" max="98" value="30"></label>
+      <p class="hint">ADC thresholds: <b id="thresholdValues">-</b></p>
+    </section>
+
+    <section class="card">
+      <div class="section-title"><h2>OLED and launches</h2><button id="refreshHistory" class="small">Refresh</button></div>
+      <label class="switch"><input id="batteryDisplay" type="checkbox"><span></span> Show battery icon on OLED</label>
+      <p><span class="muted">Saved launches:</span> <b id="recordCount">0</b></p>
+      <div id="history" class="history"></div>
+      <button id="clearHistory" class="danger">Clear launch history</button>
+    </section>
+
+    <footer>Works in Chrome or Edge over HTTPS. GitHub Pages does not need to be on the same Wi-Fi network.</footer>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
