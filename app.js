@@ -18,10 +18,10 @@ async function write(bytes) {
   if (!writeCharacteristic) throw new Error("Not connected");
   const operation = writeQueue.catch(() => {}).then(async () => {
     if (!writeCharacteristic) throw new Error("Not connected");
-    if (writeCharacteristic.writeValueWithResponse) {
-      return writeCharacteristic.writeValueWithResponse(new Uint8Array(bytes));
+    if (!writeCharacteristic.writeValueWithResponse) {
+      throw new Error("ESP32 write characteristic does not support write-with-response");
     }
-    return writeCharacteristic.writeValue(new Uint8Array(bytes));
+    return writeCharacteristic.writeValueWithResponse(new Uint8Array(bytes));
   });
   writeQueue = operation.catch(() => {});
   return operation;
@@ -30,6 +30,9 @@ async function write(bytes) {
 function handlePacket(event) {
   const d = new Uint8Array(event.target.value);
   switch (d[0]) {
+    case 0xCF:
+      if (d[2] === 1) message(`Command 0x${d[1].toString(16).toUpperCase()} accepted`);
+      break;
     case 0xC0:
       $("currentRpm").textContent = u16(d, 3);
       $("peakRpm").textContent = u16(d, 5);
@@ -70,6 +73,7 @@ async function refresh() {
   pollBusy = true;
   try {
     await write([0xC0]);
+    await write([0xC1]);
     await write([0xC2]);
   } finally {
     pollBusy = false;
@@ -103,6 +107,7 @@ function disconnect() {
 
 async function saveSettings() {
   await write([0xC4, +$("high").value, +$("low").value, $("batteryDisplay").checked ? 1 : 0, $("sensorTest").checked ? 1 : 0]);
+  await write([0xC1]);
   message("Settings saved");
 }
 
@@ -111,6 +116,8 @@ $("connectButton").onclick = async () => {
   catch (e) { message(e.message, true); }
 };
 $("saveSettings").onclick = () => saveSettings().catch(e => message(e.message, true));
+$("sensorTest").onchange = () => saveSettings().catch(e => message(e.message, true));
+$("batteryDisplay").onchange = () => saveSettings().catch(e => message(e.message, true));
 $("refreshHistory").onclick = () => write([0x74]).catch(e => message(e.message, true));
 $("clearHistory").onclick = async () => {
   if (!confirm("Clear all saved launches?")) return;
