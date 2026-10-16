@@ -18,10 +18,14 @@ async function write(bytes) {
   if (!writeCharacteristic) throw new Error("Not connected");
   const operation = writeQueue.catch(() => {}).then(async () => {
     if (!writeCharacteristic) throw new Error("Not connected");
-    if (!writeCharacteristic.writeValueWithResponse) {
-      throw new Error("ESP32 write characteristic does not support write-with-response");
+    const value = new Uint8Array(bytes);
+    if (writeCharacteristic.properties.write && writeCharacteristic.writeValueWithResponse) {
+      return writeCharacteristic.writeValueWithResponse(value);
     }
-    return writeCharacteristic.writeValueWithResponse(new Uint8Array(bytes));
+    if (writeCharacteristic.properties.write && writeCharacteristic.writeValue) {
+      return writeCharacteristic.writeValue(value);
+    }
+    throw new Error(`Write unsupported (properties: ${JSON.stringify(writeCharacteristic.properties)})`);
   });
   writeQueue = operation.catch(() => {});
   return operation;
@@ -88,6 +92,10 @@ async function connect() {
   const service = await server.getPrimaryService(SERVICE_UUID);
   notifyCharacteristic = await service.getCharacteristic(NOTIFY_UUID);
   writeCharacteristic = await service.getCharacteristic(WRITE_UUID);
+  const props = writeCharacteristic.properties;
+  if (!props.write) {
+    throw new Error(`Wrong write characteristic properties: ${JSON.stringify(props)}`);
+  }
   await notifyCharacteristic.startNotifications();
   notifyCharacteristic.addEventListener("characteristicvaluechanged", handlePacket);
   $("connectButton").textContent = "Disconnect";
@@ -126,4 +134,6 @@ $("clearHistory").onclick = async () => {
 };
 $("high").oninput = e => $("highOutput").textContent = `${e.target.value}%`;
 $("low").oninput = e => $("lowOutput").textContent = `${e.target.value}%`;
-setInterval(() => { if (writeCharacteristic) refresh().catch(() => disconnect()); }, 1000);
+setInterval(() => {
+  if (writeCharacteristic) refresh().catch(e => message(`Refresh failed: ${e.message}`, true));
+}, 1000);
