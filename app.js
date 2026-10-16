@@ -16,10 +16,15 @@ function message(text, error = false) {
 
 async function write(bytes) {
   if (!writeCharacteristic) throw new Error("Not connected");
-  writeQueue = writeQueue.then(() =>
-    writeCharacteristic.writeValueWithoutResponse(new Uint8Array(bytes))
-  );
-  return writeQueue;
+  const operation = writeQueue.catch(() => {}).then(async () => {
+    if (!writeCharacteristic) throw new Error("Not connected");
+    if (writeCharacteristic.writeValueWithResponse) {
+      return writeCharacteristic.writeValueWithResponse(new Uint8Array(bytes));
+    }
+    return writeCharacteristic.writeValue(new Uint8Array(bytes));
+  });
+  writeQueue = operation.catch(() => {});
+  return operation;
 }
 
 function handlePacket(event) {
@@ -89,6 +94,8 @@ async function connect() {
 
 function disconnect() {
   notifyCharacteristic = writeCharacteristic = null;
+  writeQueue = Promise.resolve();
+  pollBusy = false;
   $("connectButton").textContent = "Connect";
   $("state").textContent = "Disconnected";
   message("Disconnected");
