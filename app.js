@@ -4,6 +4,8 @@ const WRITE_UUID = "55c4f001-f8eb-11ec-b939-0242ac120002";
 
 let device, notifyCharacteristic, writeCharacteristic;
 let historyPackets = new Map();
+let writeQueue = Promise.resolve();
+let pollBusy = false;
 const $ = id => document.getElementById(id);
 const u16 = (d, i) => d[i] | (d[i + 1] << 8);
 
@@ -14,7 +16,10 @@ function message(text, error = false) {
 
 async function write(bytes) {
   if (!writeCharacteristic) throw new Error("Not connected");
-  await writeCharacteristic.writeValue(new Uint8Array(bytes));
+  writeQueue = writeQueue.then(() =>
+    writeCharacteristic.writeValueWithoutResponse(new Uint8Array(bytes))
+  );
+  return writeQueue;
 }
 
 function handlePacket(event) {
@@ -56,7 +61,14 @@ function renderHistory() {
 }
 
 async function refresh() {
-  await write([0xC0]); await write([0xC1]); await write([0xC2]);
+  if (pollBusy || !writeCharacteristic) return;
+  pollBusy = true;
+  try {
+    await write([0xC0]);
+    await write([0xC2]);
+  } finally {
+    pollBusy = false;
+  }
 }
 
 async function connect() {
@@ -100,4 +112,4 @@ $("clearHistory").onclick = async () => {
 };
 $("high").oninput = e => $("highOutput").textContent = `${e.target.value}%`;
 $("low").oninput = e => $("lowOutput").textContent = `${e.target.value}%`;
-setInterval(() => { if (writeCharacteristic) refresh().catch(() => disconnect()); }, 500);
+setInterval(() => { if (writeCharacteristic) refresh().catch(() => disconnect()); }, 1000);
