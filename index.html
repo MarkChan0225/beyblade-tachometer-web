@@ -3,55 +3,113 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#10131a">
-  <title>Beyblade Tachometer</title>
+  <meta name="theme-color" content="#0f1522">
+  <title>Beyblade Tachometer Dashboard</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <main class="shell">
-    <header>
+    <header class="topbar">
       <div>
-        <p class="eyebrow">ESP32-S3 / ITR1113</p>
-        <h1>Beyblade Tachometer</h1>
+        <p class="eyebrow">ESP32-S3 · ITR1113 · SSD1306</p>
+        <h1>Beyblade Tachometer Dashboard</h1>
       </div>
-      <button id="connectButton" class="primary">Connect</button>
+      <div class="actions">
+        <button id="connectButton" class="primary">Connect</button>
+        <button id="disconnectButton" class="ghost" disabled>Disconnect</button>
+      </div>
     </header>
 
+    <p id="compatibilityMessage" class="message warning" hidden></p>
     <p id="message" class="message">Connect to your tachometer over Bluetooth.</p>
 
-    <section class="metrics">
-      <article><span>Current RPM</span><strong id="currentRpm">0</strong></article>
-      <article><span>Peak RPM</span><strong id="peakRpm">0</strong></article>
-      <article><span>Top RPM</span><strong id="topRpm">0</strong></article>
-      <article><span>Battery</span><strong id="batteryValue">-</strong></article>
+    <section class="metrics" aria-label="Live status">
+      <article>
+        <span>State</span>
+        <strong id="state">Disconnected</strong>
+      </article>
+      <article>
+        <span>Latest RPM</span>
+        <strong id="currentRpm">0</strong>
+      </article>
+      <article>
+        <span>Peak RPM</span>
+        <strong id="peakRpm">0</strong>
+      </article>
+      <article>
+        <span>Max RPM</span>
+        <strong id="maxRpm">0</strong>
+      </article>
+      <article id="batteryCard">
+        <span>Battery</span>
+        <strong id="batteryValue">-</strong>
+      </article>
+      <article>
+        <span>Latest Launch</span>
+        <strong id="latestLaunch">-</strong>
+      </article>
+      <article>
+        <span>Launch Count</span>
+        <strong id="launchCount">0</strong>
+      </article>
     </section>
 
-    <section class="card">
-      <div class="section-title"><h2>Sensor test</h2><span id="state" class="pill">Disconnected</span></div>
-      <div class="sensor-readout"><strong id="sensorValue">0</strong><span id="sensorState">-</span></div>
-      <div class="bar"><i id="sensorBar"></i></div>
-      <p class="hint">Move the ITR1113 over white and black surfaces while watching the ADC value.</p>
-      <label class="switch"><input id="sensorTest" type="checkbox"><span></span> Sensor test mode</label>
-      <p id="sensorHint" class="hint">Enable sensor test to stream ADC readings from the ESP32.</p>
+    <section class="card" aria-labelledby="historyTitle">
+      <div class="row">
+        <h2 id="historyTitle">Launch history</h2>
+        <button id="refreshHistory" class="small" disabled>Refresh history (0x74)</button>
+      </div>
+      <p class="hint">Parses history packets <code>0xB0</code>-<code>0xB7</code>. Cached values can be cleared locally.</p>
+      <ul id="history" class="history" aria-live="polite"></ul>
+      <button id="clearHistory" class="ghost" disabled>Clear local history cache</button>
     </section>
 
-    <section class="card">
-      <div class="section-title"><h2>Thresholds</h2><button id="saveSettings" class="small">Save</button></div>
-      <label>High threshold <output id="highOutput">70%</output><input id="high" type="range" min="1" max="99" value="70"></label>
-      <label>Low threshold <output id="lowOutput">30%</output><input id="low" type="range" min="0" max="98" value="30"></label>
-      <p class="hint">ADC thresholds: <b id="thresholdValues">-</b></p>
+    <section class="card" aria-labelledby="curveTitle">
+      <h2 id="curveTitle">Launch curve</h2>
+      <p class="hint">Shows packet segments <code>0x70</code>-<code>0x73</code> when received.</p>
+      <p id="curveEmpty" class="hint">No curve data received yet.</p>
+      <svg class="curve" viewBox="0 0 300 120" role="img" aria-label="Launch curve">
+        <polyline id="curveChart" points=""></polyline>
+      </svg>
     </section>
 
-    <section class="card">
-      <div class="section-title"><h2>OLED and launches</h2><button id="refreshHistory" class="small">Refresh</button></div>
-      <label class="switch"><input id="batteryDisplay" type="checkbox"><span></span> Show battery icon on OLED</label>
-      <p><span class="muted">Saved launches:</span> <b id="recordCount">0</b></p>
-      <div id="history" class="history"></div>
-      <button id="clearHistory" class="danger">Clear launch history</button>
+    <section class="card" aria-labelledby="sensorTitle">
+      <div class="row">
+        <h2 id="sensorTitle">ITR1113 sensor test</h2>
+        <div class="actions">
+          <button id="startSensorTest" class="small" disabled>Start</button>
+          <button id="stopSensorTest" class="small ghost" disabled>Stop</button>
+        </div>
+      </div>
+      <p id="sensorStatus" class="hint">Sensor test is idle.</p>
+      <p id="sensorRaw" class="hint">Raw sensor stream not detected yet.</p>
+      <p id="sensorDerived" class="hint">Move your Beyblade to generate status and curve packets.</p>
+      <p class="hint">Current firmware does not publish dedicated raw ITR1113 packets. The UI is ready for future firmware packet extensions.</p>
     </section>
 
-    <footer>Works in Chrome or Edge over HTTPS. GitHub Pages does not need to be on the same Wi-Fi network.</footer>
+    <section class="card" aria-labelledby="thresholdTitle">
+      <h2 id="thresholdTitle">Threshold configuration</h2>
+      <p class="hint">Set ADC thresholds (0-4095). Values are validated locally and sent with the proposed command <code>0x76</code>.</p>
+      <p class="hint">This firmware may acknowledge unknown commands without storing them. Treat threshold persistence as unsupported until firmware is extended.</p>
+      <div class="grid-2">
+        <label for="lowThreshold">Low threshold</label>
+        <input id="lowThreshold" type="number" min="0" max="4095" step="1" value="1200">
+        <label for="highThreshold">High threshold</label>
+        <input id="highThreshold" type="number" min="0" max="4095" step="1" value="2800">
+      </div>
+      <p id="thresholdMessage" class="hint">Threshold command not sent yet.</p>
+      <button id="applyThresholds" class="small" disabled>Send threshold command</button>
+    </section>
+
+    <section class="card" aria-labelledby="displayTitle">
+      <h2 id="displayTitle">Dashboard display settings</h2>
+      <label class="switch" for="batteryToggle">
+        <input id="batteryToggle" type="checkbox">
+        <span>Show battery panel in dashboard</span>
+      </label>
+      <p class="hint">Saved in this browser only.</p>
+    </section>
   </main>
-  <script src="app.js?v=20261017-1"></script>
+  <script type="module" src="app.js?v=20261017-2"></script>
 </body>
 </html>
