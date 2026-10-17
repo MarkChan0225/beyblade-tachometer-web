@@ -6,13 +6,27 @@ export const PACKET_LENGTH = 17;
 
 export const COMMANDS = Object.freeze({
   REQUEST_HISTORY: 0x74,
-  PROPOSED_SENSOR_TEST: 0x75,
-  PROPOSED_THRESHOLD_CONFIG: 0x76,
+  SENSOR_TEST: 0x75,
+  THRESHOLD_CONFIG: 0x76,
+  READ_CONFIG: 0x77,
 });
 
 const HISTORY_SLOT_COUNT = 50;
 const HISTORY_DATA_HEADERS = new Set([0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6]);
 const RPM_LIMIT = 65000;
+
+export const EXTENDED_HEADERS = Object.freeze({
+  SENSOR_RAW: 0xc0,
+  CONFIG_ACK: 0xce,
+});
+
+export const RESULT_CODES = Object.freeze({
+  ACCEPTED: 0x00,
+  ACCEPTED_PERSISTED: 0x01,
+  INVALID_VALUE: 0x02,
+  UNSUPPORTED: 0x03,
+  MALFORMED: 0x04,
+});
 
 const u16le = (bytes, offset) => bytes[offset] | (bytes[offset + 1] << 8);
 
@@ -89,6 +103,32 @@ const parseCurvePacket = bytes => {
   };
 };
 
+const parseSensorRawPacket = bytes => ({
+  kind: "sensorRaw",
+  rawAdc: u16le(bytes, 1),
+  lowThreshold: u16le(bytes, 3),
+  highThreshold: u16le(bytes, 5),
+  blackState: bytes[7] === 0x01,
+  sampleSequence: bytes[8],
+  running: (bytes[9] & 0x01) === 0x01,
+});
+
+const parseConfigAckPacket = bytes => ({
+  kind: "configAck",
+  command: bytes[1],
+  resultCode: bytes[2],
+  accepted: bytes[2] === RESULT_CODES.ACCEPTED || bytes[2] === RESULT_CODES.ACCEPTED_PERSISTED,
+  persisted: bytes[2] === RESULT_CODES.ACCEPTED_PERSISTED || (bytes[3] & 0x08) === 0x08,
+  capabilities: {
+    sensorTest: (bytes[3] & 0x01) === 0x01,
+    thresholdConfig: (bytes[3] & 0x02) === 0x02,
+    sensorTestRunning: (bytes[3] & 0x04) === 0x04,
+  },
+  lowThreshold: u16le(bytes, 4),
+  highThreshold: u16le(bytes, 6),
+  sequence: bytes[8],
+});
+
 const parseAckPacket = bytes => ({
   kind: "ack",
   command: bytes[1],
@@ -114,8 +154,16 @@ export const parsePacket = value => {
   if (HISTORY_DATA_HEADERS.has(header)) return parseHistoryDataPacket(bytes);
   if (header === 0xB7) return parseHistoryChecksumPacket(bytes);
   if (header >= 0x70 && header <= 0x73) return parseCurvePacket(bytes);
+  if (header === EXTENDED_HEADERS.SENSOR_RAW) return parseSensorRawPacket(bytes);
+  if (header === EXTENDED_HEADERS.CONFIG_ACK) return parseConfigAckPacket(bytes);
   if (header === 0xCF) return parseAckPacket(bytes);
-  if ((header === COMMANDS.REQUEST_HISTORY || header === COMMANDS.PROPOSED_SENSOR_TEST || header === COMMANDS.PROPOSED_THRESHOLD_CONFIG) && bytes[1] === 0x01) {
+  if (
+    (header === COMMANDS.REQUEST_HISTORY ||
+      header === COMMANDS.SENSOR_TEST ||
+      header === COMMANDS.THRESHOLD_CONFIG ||
+      header === COMMANDS.READ_CONFIG) &&
+    bytes[1] === 0x01
+  ) {
     return parseGenericAckPacket(bytes);
   }
 
@@ -244,10 +292,18 @@ export const validateThresholdInput = (lowRaw, highRaw) => {
 };
 
 export const buildThresholdConfigCommand = (low, high) =>
-  new Uint8Array([COMMANDS.PROPOSED_THRESHOLD_CONFIG, low & 0xff, low >> 8, high & 0xff, high >> 8]);
+  new Uint8Array([COMMANDS.THRESHOLD_CONFIG, low & 0xff, low >> 8, high & 0xff, high >> 8]);
 
-export const buildSensorTestCommand = enabled => new Uint8Array([COMMANDS.PROPOSED_SENSOR_TEST, enabled ? 1 : 0]);
+export const buildSensorTestCommand = enabled => new Uint8Array([COMMANDS.SENSOR_TEST, enabled ? 1 : 0]);
 
-export const isCommandSupported = command => command === COMMANDS.REQUEST_HISTORY;
+export const buildReadConfigCommand = () => new Uint8Array([COMMANDS.READ_CONFIG]);
+
+export const isCommandSupported = (command, capabilities = {}) => {
+  if (command === COMMANDS.REQUEST_HISTORY) return true;
+  if (command === COMMANDS.READ_CONFIG) return true;
+  if (command === COMMANDS.SENSOR_TEST) return !!capabilities.sensorTest;
+  if (command === COMMANDS.THRESHOLD_CONFIG) return !!capabilities.thresholdConfig;
+  return false;
+};
 
 export const deriveApproxRpmFromInterval = intervalToApproxRpm;
