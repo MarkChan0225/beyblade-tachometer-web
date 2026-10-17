@@ -4,30 +4,34 @@ import {
   BLE_SERVICE_UUID,
   BLE_WRITE_UUID,
   COMMANDS,
-  buildSensorTestCommand,
-  buildThresholdConfigCommand,
   mergeCurveSegments,
   mergeHistorySlots,
   parsePacket,
-  validateThresholdInput,
 } from "./protocol.mjs";
 
 const BATTERY_VISIBILITY_KEY = "tachometer.showBattery";
-const STATE_LABELS = ["Boot", "Ready", "Review"];
+const STATE_LABELS = Object.freeze({
+  0x00: "Idle",
+  0x04: "Attached",
+  0x10: "On",
+});
 const $ = id => document.getElementById(id);
 
 const state = {
   device: null,
+  disconnectHandler: null,
   notifyCharacteristic: null,
   writeCharacteristic: null,
   writeQueue: Promise.resolve(),
   historySlots: new Map(),
+  historyChecksum: null,
   curveSegments: new Map(),
   launches: [],
-  curvePoints: [],
+  historyOrder: "packet-slot",
+  curveIntervals: [],
+  curveApproxRpm: [],
   sensorTestRunning: false,
   batteryVisible: true,
-  lastSensorValue: null,
 };
 
 const ui = {
@@ -74,20 +78,22 @@ const toggleConnectedUi = connected => {
   ui.disconnect.disabled = !connected;
   ui.refreshHistory.disabled = !connected;
   ui.clearHistory.disabled = !connected;
-  ui.startSensorTest.disabled = !connected;
-  ui.stopSensorTest.disabled = !connected;
-  ui.applyThresholds.disabled = !connected;
+  ui.startSensorTest.disabled = true;
+  ui.stopSensorTest.disabled = true;
+  ui.applyThresholds.disabled = true;
 };
 
 const resetTelemetry = () => {
   state.historySlots.clear();
+  state.historyChecksum = null;
   state.curveSegments.clear();
   state.launches = [];
-  state.curvePoints = [];
-  state.lastSensorValue = null;
+  state.historyOrder = "packet-slot";
+  state.curveIntervals = [];
+  state.curveApproxRpm = [];
 
-  ui.currentRpm.textContent = "0";
-  ui.peakRpm.textContent = "0";
+  ui.currentRpm.textContent = "Unavailable";
+  ui.peakRpm.textContent = "Unavailable";
   ui.maxRpm.textContent = "0";
   ui.launchCount.textContent = "0";
   ui.latestLaunch.textContent = "-";
@@ -117,17 +123,19 @@ const renderHistory = () => {
     return;
   }
 
+  const orderLabel = state.historyOrder === "newest-first" ? "newest-first" : "packet-slot order";
   state.launches.slice(0, 32).forEach((rpm, index) => {
     const item = document.createElement("li");
-    item.innerHTML = `<span>#${index + 1}</span><strong>${rpm}</strong>`;
+    item.innerHTML = `<span>#${index + 1} (${orderLabel})</span><strong>${rpm}</strong>`;
     ui.historyList.append(item);
   });
 };
 
 const renderCurve = () => {
-  const points = state.curvePoints;
+  const points = state.curveApproxRpm;
   if (!points.length) {
     ui.curveEmpty.hidden = false;
+    ui.curveEmpty.textContent = "No curve data received yet.";
     ui.curveSvg.setAttribute("points", "");
     return;
   }
@@ -141,28 +149,43 @@ const renderCurve = () => {
     return `${x.toFixed(1)},${y.toFixed(1)}`;
   });
 
-  ui.curveEmpty.hidden = true;
+  ui.curveEmpty.hidden = false;
+  ui.curveEmpty.textContent = "Curve plot shows approximate RPM derived from interval samples (0x70-0x73).";
   ui.curveSvg.setAttribute("points", path.join(" "));
 };
 
+const detachListeners = () => {
+  if (state.notifyCharacteristic) {
+    state.notifyCharacteristic.removeEventListener("characteristicvaluechanged", handlePacket);
+  }
+  if (state.device && state.disconnectHandler) {
+    state.device.removeEventListener("gattserverdisconnected", state.disconnectHandler);
+  }
+  state.disconnectHandler = null;
+};
+
 const enqueueWrite = async bytes => {
-  if (!state.writeCharacteristic) throw new Error("Device is not connected.");
+  if (!state.writeCharacteristic) throw new Error("Write characteristic is not connected.");
 
   const operation = state.writeQueue.catch(() => {}).then(async () => {
-    if (!state.writeCharacteristic) throw new Error("Device is not connected.");
+    if (!state.writeCharacteristic) throw new Error("Write characteristic is not connected.");
     const value = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
 
-    if (state.writeCharacteristic.properties.write && state.writeCharacteristic.writeValueWithResponse) {
-      await state.writeCharacteristic.writeValueWithResponse(value);
-      return;
-    }
-    if (state.writeCharacteristic.properties.writeWithoutResponse && state.writeCharacteristic.writeValueWithoutResponse) {
-      await state.writeCharacteristic.writeValueWithoutResponse(value);
-      return;
-    }
-    if (state.writeCharacteristic.properties.write && state.writeCharacteristic.writeValue) {
-      await state.writeCharacteristic.writeValue(value);
-      return;
+    try {
+      if (state.writeCharacteristic.properties.write && state.writeCharacteristic.writeValueWithResponse) {
+        await state.writeCharacteristic.writeValueWithResponse(value);
+        return;
+      }
+      if (state.writeCharacteristic.properties.writeWithoutResponse && state.writeCharacteristic.writeValueWithoutResponse) {
+        await state.writeCharacteristic.writeValueWithoutResponse(value);
+        return;
+      }
+      if (state.writeCharacteristic.properties.write && state.writeCharacteristic.writeValue) {
+        await state.writeCharacteristic.writeValue(value);
+        return;
+      }
+    } catch (error) {
+      throw new Error(`Failed to write command 0x${value[0].toString(16)}: ${error.message || "write failed"}`);
     }
 
     throw new Error("Connected characteristic does not support writing commands.");
@@ -173,29 +196,33 @@ const enqueueWrite = async bytes => {
 };
 
 const refreshHistory = async () => {
-  state.historySlots.clear();
-  state.launches = [];
-  renderHistory();
   await enqueueWrite([COMMANDS.REQUEST_HISTORY]);
 };
 
 const updateStatusFromPacket = packet => {
-  ui.currentRpm.textContent = String(packet.latestRpm);
-  ui.peakRpm.textContent = String(packet.peakRpm);
+  ui.currentRpm.textContent = "Unavailable";
+  ui.peakRpm.textContent = "Unavailable";
   ui.maxRpm.textContent = String(packet.maxRpm);
   ui.launchCount.textContent = String(packet.launchCount);
-  ui.latestLaunch.textContent = packet.latestRpm > 0 ? `${packet.latestRpm} RPM` : "Waiting for launch";
-  ui.sensorDerived.textContent = `State: ${packet.measuring ? "Measuring" : STATE_LABELS[packet.mode] || "Ready"}`;
-  setStateChip(packet.measuring ? "Measuring" : STATE_LABELS[packet.mode] || "Ready");
 
-  if (packet.batteryPercent === null || packet.batteryVoltage === null) {
+  const stateLabel = STATE_LABELS[packet.stateCode] || `State 0x${packet.stateCode.toString(16).padStart(2, "0")}`;
+  setStateChip(stateLabel);
+  ui.sensorDerived.textContent = `Status packet state: ${stateLabel}`;
+
+  if (packet.batteryPercent === null) {
     ui.batteryValue.textContent = "Unavailable";
   } else {
-    ui.batteryValue.textContent = `${packet.batteryPercent}% (${packet.batteryVoltage.toFixed(2)} V)`;
+    ui.batteryValue.textContent = `${packet.batteryPercent}%`;
+  }
+
+  if (state.launches.length) {
+    ui.latestLaunch.textContent = `${state.launches[0]} RPM`;
+  } else {
+    ui.latestLaunch.textContent = "Waiting for launch";
   }
 };
 
-const handlePacket = event => {
+function handlePacket(event) {
   const parsed = parsePacket(event.target.value);
 
   if (parsed.kind === "invalid") {
@@ -208,20 +235,9 @@ const handlePacket = event => {
   }
 
   if (parsed.kind === "ack") {
-    if (parsed.command === COMMANDS.PROPOSED_THRESHOLD_CONFIG) {
-      ui.thresholdMessage.textContent = parsed.accepted
-        ? "Device acknowledged threshold command, but this firmware may not persist settings yet."
-        : "Device rejected threshold command.";
-      return;
+    if (parsed.command === COMMANDS.PROPOSED_THRESHOLD_CONFIG || parsed.command === COMMANDS.PROPOSED_SENSOR_TEST) {
+      setMessage("Firmware acknowledged an unsupported extension command (0x75/0x76). This dashboard keeps these controls disabled.");
     }
-
-    if (parsed.command === COMMANDS.PROPOSED_SENSOR_TEST) {
-      ui.sensorStatus.textContent = parsed.accepted
-        ? "Sensor test command acknowledged. Waiting for raw data packets from firmware extension."
-        : "Sensor test command rejected by device.";
-      return;
-    }
-
     return;
   }
 
@@ -232,19 +248,47 @@ const handlePacket = event => {
 
   if (parsed.kind === "history") {
     state.historySlots.set(parsed.slot, parsed);
-    state.launches = mergeHistorySlots(state.historySlots);
+    const merged = mergeHistorySlots(state.historySlots, state.historyChecksum);
+    state.launches = merged.launches;
+    state.historyOrder = merged.order;
     renderHistory();
+
+    if (merged.checksum && !merged.checksum.valid) {
+      setMessage(
+        `History checksum mismatch (expected 0x${merged.checksum.expected.toString(16)}, got 0x${merged.checksum.computed.toString(16)}).`,
+        true,
+      );
+    }
+
+    if (state.launches.length) {
+      ui.latestLaunch.textContent = `${state.launches[0]} RPM`;
+    }
+    return;
+  }
+
+  if (parsed.kind === "historyChecksum") {
+    state.historyChecksum = parsed;
+    const merged = mergeHistorySlots(state.historySlots, state.historyChecksum);
+    if (merged.checksum && !merged.checksum.valid) {
+      setMessage(
+        `History checksum mismatch (expected 0x${merged.checksum.expected.toString(16)}, got 0x${merged.checksum.computed.toString(16)}).`,
+        true,
+      );
+    }
     return;
   }
 
   if (parsed.kind === "curve") {
     state.curveSegments.set(parsed.segment, parsed);
-    state.curvePoints = mergeCurveSegments(state.curveSegments);
+    const merged = mergeCurveSegments(state.curveSegments);
+    state.curveIntervals = merged.intervals;
+    state.curveApproxRpm = merged.rpmApprox;
     renderCurve();
   }
-};
+}
 
 const handleDisconnect = () => {
+  detachListeners();
   state.device = null;
   state.notifyCharacteristic = null;
   state.writeCharacteristic = null;
@@ -254,7 +298,8 @@ const handleDisconnect = () => {
   toggleConnectedUi(false);
   setStateChip("Disconnected");
   setMessage("Disconnected from tachometer.");
-  ui.sensorStatus.textContent = "Sensor test is idle.";
+  ui.sensorStatus.textContent = "Sensor test unsupported by current firmware (0x75 not implemented).";
+  ui.thresholdMessage.textContent = "Threshold configuration unsupported by current firmware (0x76 not implemented).";
   resetTelemetry();
 };
 
@@ -263,37 +308,88 @@ const connect = async () => {
     throw new Error("Web Bluetooth is unavailable in this browser. Use Chrome or Edge over HTTPS or localhost.");
   }
 
-  const device = await navigator.bluetooth.requestDevice({
-    filters: [{ services: [BLE_SERVICE_UUID] }, { namePrefix: "BEYBLADE_TOOL" }, { name: BLE_DEVICE_NAME }],
-    optionalServices: [BLE_SERVICE_UUID],
-  });
+  let device;
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [BLE_SERVICE_UUID] }, { namePrefix: "BEYBLADE_TOOL" }, { name: BLE_DEVICE_NAME }],
+      optionalServices: [BLE_SERVICE_UUID],
+    });
+  } catch (error) {
+    if (error?.name === "NotFoundError") {
+      throw new Error("No Bluetooth device was selected.");
+    }
+    throw new Error(error.message || "Failed to open the Bluetooth device chooser.");
+  }
+
+  if (!device?.gatt) {
+    throw new Error("Selected device does not expose a GATT server.");
+  }
+
+  detachListeners();
+  state.device = device;
 
   const onDisconnect = () => {
-    if (state.device) state.device.removeEventListener("gattserverdisconnected", onDisconnect);
-    handleDisconnect();
+    if (state.device === device) handleDisconnect();
   };
-
+  state.disconnectHandler = onDisconnect;
   device.addEventListener("gattserverdisconnected", onDisconnect);
 
-  const server = await device.gatt.connect();
-  const service = await server.getPrimaryService(BLE_SERVICE_UUID);
-  const notify = await service.getCharacteristic(BLE_NOTIFY_UUID);
-  const write = await service.getCharacteristic(BLE_WRITE_UUID);
+  try {
+    const server = await device.gatt.connect();
 
-  await notify.startNotifications();
-  notify.addEventListener("characteristicvaluechanged", handlePacket);
+    let service;
+    try {
+      service = await server.getPrimaryService(BLE_SERVICE_UUID);
+    } catch {
+      throw new Error(`Required BLE service not found: ${BLE_SERVICE_UUID}.`);
+    }
 
-  state.device = device;
-  state.notifyCharacteristic = notify;
-  state.writeCharacteristic = write;
-  state.writeQueue = Promise.resolve();
+    let notify;
+    try {
+      notify = await service.getCharacteristic(BLE_NOTIFY_UUID);
+    } catch {
+      throw new Error(`Notify characteristic not found: ${BLE_NOTIFY_UUID}.`);
+    }
 
-  toggleConnectedUi(true);
-  setStateChip("Connected");
-  setMessage(`Connected to ${device.name || "tachometer"}. Waiting for packets...`);
+    let write;
+    try {
+      write = await service.getCharacteristic(BLE_WRITE_UUID);
+    } catch {
+      throw new Error(`Write characteristic not found: ${BLE_WRITE_UUID}.`);
+    }
 
-  resetTelemetry();
-  await refreshHistory();
+    try {
+      await notify.startNotifications();
+    } catch {
+      throw new Error("Failed to start notifications on the notify characteristic.");
+    }
+
+    notify.addEventListener("characteristicvaluechanged", handlePacket);
+
+    state.notifyCharacteristic = notify;
+    state.writeCharacteristic = write;
+    state.writeQueue = Promise.resolve();
+
+    toggleConnectedUi(true);
+    setStateChip("Connected");
+    setMessage(`Connected to ${device.name || "tachometer"}. Waiting for packets...`);
+
+    resetTelemetry();
+
+    try {
+      await refreshHistory();
+      setMessage("Requested launch history (0x74). Waiting for B0-B7 packets...");
+    } catch (error) {
+      setMessage(error.message || "Connected, but failed to request history.", true);
+    }
+  } catch (error) {
+    detachListeners();
+    state.device = null;
+    state.notifyCharacteristic = null;
+    state.writeCharacteristic = null;
+    state.writeQueue = Promise.resolve();
+    throw error;
+  }
 };
 
 const disconnect = () => {
@@ -305,29 +401,20 @@ const disconnect = () => {
 };
 
 const startSensorTest = async () => {
-  state.sensorTestRunning = true;
-  ui.sensorStatus.textContent = "Sensor test requested. Firmware extension required for raw packet streaming.";
-  ui.sensorRaw.textContent = "Raw sensor stream not detected yet.";
-  await enqueueWrite(buildSensorTestCommand(true));
+  state.sensorTestRunning = false;
+  ui.sensorStatus.textContent = "Sensor test unsupported by current firmware (0x75 not implemented).";
+  setMessage("0x75 sensor test command is disabled because this firmware does not implement it.");
 };
 
 const stopSensorTest = async () => {
   state.sensorTestRunning = false;
-  ui.sensorStatus.textContent = "Sensor test stop requested.";
-  await enqueueWrite(buildSensorTestCommand(false));
+  ui.sensorStatus.textContent = "Sensor test unsupported by current firmware (0x75 not implemented).";
+  setMessage("0x75 sensor test command is disabled because this firmware does not implement it.");
 };
 
 const applyThresholds = async () => {
-  const validation = validateThresholdInput(ui.lowThreshold.value, ui.highThreshold.value);
-  if (!validation.valid) {
-    ui.thresholdMessage.textContent = validation.message;
-    return;
-  }
-
-  ui.thresholdMessage.textContent =
-    "Command sent. Persisting thresholds requires firmware support for the proposed 0x76 configuration command.";
-
-  await enqueueWrite(buildThresholdConfigCommand(validation.low, validation.high));
+  ui.thresholdMessage.textContent = "Threshold configuration unsupported by current firmware (0x76 not implemented).";
+  setMessage("0x76 threshold command is disabled because this firmware does not implement it.");
 };
 
 const wireEvents = () => {
@@ -352,6 +439,7 @@ const wireEvents = () => {
 
   ui.clearHistory.addEventListener("click", () => {
     state.historySlots.clear();
+    state.historyChecksum = null;
     state.launches = [];
     renderHistory();
     setMessage("Cleared dashboard history cache. Device history remains unchanged.");
@@ -397,6 +485,9 @@ const init = () => {
 
   const batterySetting = localStorage.getItem(BATTERY_VISIBILITY_KEY);
   updateBatteryVisibility(batterySetting !== "0");
+
+  ui.sensorStatus.textContent = "Sensor test unsupported by current firmware (0x75 not implemented).";
+  ui.thresholdMessage.textContent = "Threshold configuration unsupported by current firmware (0x76 not implemented).";
 
   wireEvents();
   toggleConnectedUi(false);

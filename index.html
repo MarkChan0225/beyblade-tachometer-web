@@ -77,8 +77,8 @@
       <div class="row">
         <h2 id="sensorTitle">ITR1113 sensor test</h2>
         <div class="actions">
-          <button id="startSensorTest" class="small" disabled>Start</button>
-          <button id="stopSensorTest" class="small ghost" disabled>Stop</button>
+          <button id="startSensorTest" class="small" disabled>Unsupported (0x75)</button>
+          <button id="stopSensorTest" class="small ghost" disabled>Unsupported</button>
         </div>
       </div>
       <p id="sensorStatus" class="hint">Sensor test is idle.</p>
@@ -89,8 +89,8 @@
 
     <section class="card" aria-labelledby="thresholdTitle">
       <h2 id="thresholdTitle">Threshold configuration</h2>
-      <p class="hint">Set ADC thresholds (0-4095). Values are validated locally and sent with the proposed command <code>0x76</code>.</p>
-      <p class="hint">This firmware may acknowledge unknown commands without storing them. Treat threshold persistence as unsupported until firmware is extended.</p>
+      <p class="hint">Set ADC thresholds (0-4095). The dashboard validates values locally, but command <code>0x76</code> is disabled because current firmware does not implement threshold writes.</p>
+      <p class="hint">The controls are kept visible for future firmware support.</p>
       <div class="grid-2">
         <label for="lowThreshold">Low threshold</label>
         <input id="lowThreshold" type="number" min="0" max="4095" step="1" value="1200">
@@ -98,7 +98,7 @@
         <input id="highThreshold" type="number" min="0" max="4095" step="1" value="2800">
       </div>
       <p id="thresholdMessage" class="hint">Threshold command not sent yet.</p>
-      <button id="applyThresholds" class="small" disabled>Send threshold command</button>
+      <button id="applyThresholds" class="small" disabled>Unsupported (0x76)</button>
     </section>
 
     <section class="card" aria-labelledby="displayTitle">

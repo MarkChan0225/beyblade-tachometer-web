@@ -10,6 +10,8 @@ export const COMMANDS = Object.freeze({
   PROPOSED_THRESHOLD_CONFIG: 0x76,
 });
 
+const HISTORY_SLOT_COUNT = 50;
+const HISTORY_DATA_HEADERS = new Set([0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6]);
 const RPM_LIMIT = 65000;
 
 const u16le = (bytes, offset) => bytes[offset] | (bytes[offset + 1] << 8);
@@ -23,57 +25,82 @@ const asUint8Array = value => {
   return null;
 };
 
-const parseStatusPacket = bytes => {
-  const latestRpm = u16le(bytes, 3);
-  const peakRpm = u16le(bytes, 5);
-  const maxRpm = u16le(bytes, 7);
-  const batteryPercent = bytes[9];
-  const batteryVoltage = u16le(bytes, 10) / 100;
-
-  return {
-    kind: "status",
-    mode: bytes[1],
-    measuring: bytes[2] === 1,
-    latestRpm: latestRpm <= RPM_LIMIT ? latestRpm : 0,
-    peakRpm: peakRpm <= RPM_LIMIT ? peakRpm : 0,
-    maxRpm: maxRpm <= RPM_LIMIT ? maxRpm : 0,
-    batteryPercent: batteryPercent <= 100 ? batteryPercent : null,
-    batteryVoltage: Number.isFinite(batteryVoltage) ? batteryVoltage : null,
-    launchCount: bytes[12],
-  };
+const toBatteryPercent = raw => {
+  if (!Number.isInteger(raw) || raw < 0 || raw > 250) return null;
+  return Math.round((raw / 250) * 100);
 };
 
-const parseHistoryPacket = bytes => {
+const intervalToApproxRpm = interval => {
+  if (!Number.isInteger(interval) || interval <= 0) return null;
+  const rpm = Math.round(7500000 / interval);
+  if (!Number.isFinite(rpm) || rpm <= 0 || rpm > RPM_LIMIT) return null;
+  return rpm;
+};
+
+const parseStatusPacket = bytes => ({
+  kind: "status",
+  stateCode: bytes[3],
+  batteryRaw: bytes[4],
+  batteryPercent: toBatteryPercent(bytes[4]),
+  latestRpm: null,
+  peakRpm: null,
+  batteryVoltage: null,
+  maxRpm: u16le(bytes, 7),
+  launchCount: u16le(bytes, 9),
+});
+
+const parseHistoryDataPacket = bytes => {
+  const slot = bytes[0] - 0xB0;
   const values = [];
   for (let i = 1; i < PACKET_LENGTH; i += 2) {
-    const value = u16le(bytes, i);
-    values.push(value <= RPM_LIMIT ? value : 0);
+    values.push(u16le(bytes, i));
   }
 
   return {
     kind: "history",
-    slot: bytes[0] - 0xB0,
+    slot,
     values,
+    totalCounter: slot === 6 ? u16le(bytes, 9) : null,
+    listIndex: slot === 6 ? bytes[11] : null,
+    payload: bytes.slice(1),
   };
 };
 
+const parseHistoryChecksumPacket = bytes => ({
+  kind: "historyChecksum",
+  checksumLowByte: bytes[16],
+  payload: bytes.slice(1),
+});
+
 const parseCurvePacket = bytes => {
-  const points = [];
+  const intervals = [];
+  const rpmApprox = [];
   for (let i = 1; i < PACKET_LENGTH; i += 2) {
-    points.push(u16le(bytes, i));
+    const interval = u16le(bytes, i);
+    intervals.push(interval);
+    rpmApprox.push(intervalToApproxRpm(interval));
   }
 
   return {
     kind: "curve",
     segment: bytes[0] - 0x70,
-    points,
+    intervals,
+    rpmApprox,
   };
 };
 
 const parseAckPacket = bytes => ({
   kind: "ack",
   command: bytes[1],
-  accepted: bytes[2] === 1,
+  accepted: bytes[2] === 0x01,
+  format: "legacy",
+});
+
+const parseGenericAckPacket = bytes => ({
+  kind: "ack",
+  command: bytes[0],
+  accepted: bytes[1] === 0x01,
+  format: "generic",
 });
 
 export const parsePacket = value => {
@@ -84,35 +111,119 @@ export const parsePacket = value => {
 
   const header = bytes[0];
   if (header === 0xA0) return parseStatusPacket(bytes);
-  if (header >= 0xB0 && header <= 0xB7) return parseHistoryPacket(bytes);
+  if (HISTORY_DATA_HEADERS.has(header)) return parseHistoryDataPacket(bytes);
+  if (header === 0xB7) return parseHistoryChecksumPacket(bytes);
   if (header >= 0x70 && header <= 0x73) return parseCurvePacket(bytes);
   if (header === 0xCF) return parseAckPacket(bytes);
+  if ((header === COMMANDS.REQUEST_HISTORY || header === COMMANDS.PROPOSED_SENSOR_TEST || header === COMMANDS.PROPOSED_THRESHOLD_CONFIG) && bytes[1] === 0x01) {
+    return parseGenericAckPacket(bytes);
+  }
 
   return { kind: "unknown", header };
 };
 
-export const mergeHistorySlots = slots => {
-  const launches = [];
-  for (let i = 0; i <= 7; i++) {
-    const packet = slots.get(i);
+const buildHistoryRecordArray = slots => {
+  const records = new Array(HISTORY_SLOT_COUNT).fill(0);
+
+  for (let slot = 0; slot <= 5; slot += 1) {
+    const packet = slots.get(slot);
     if (!packet) continue;
-    for (const value of packet.values) {
-      if (value > 0) launches.push(value);
+
+    for (let i = 0; i < 8; i += 1) {
+      records[slot * 8 + i] = packet.values[i] || 0;
     }
   }
-  return launches;
+
+  const lastPacket = slots.get(6);
+  if (lastPacket) {
+    records[48] = lastPacket.values[0] || 0;
+    records[49] = lastPacket.values[1] || 0;
+  }
+
+  return records;
+};
+
+const isValidHistoryValue = value => Number.isInteger(value) && value > 0 && value <= RPM_LIMIT;
+
+const validateHistoryChecksum = (slots, checksumPacket) => {
+  if (!checksumPacket) return null;
+
+  for (let slot = 0; slot <= 6; slot += 1) {
+    if (!slots.get(slot)) return null;
+  }
+
+  let sum = 0;
+  for (let slot = 0; slot <= 6; slot += 1) {
+    const packet = slots.get(slot);
+    for (const byte of packet.payload) {
+      sum += byte;
+    }
+  }
+
+  const computed = sum & 0xff;
+  return {
+    expected: checksumPacket.checksumLowByte,
+    computed,
+    valid: computed === checksumPacket.checksumLowByte,
+  };
+};
+
+export const mergeHistorySlots = (slots, checksumPacket = null) => {
+  const records = buildHistoryRecordArray(slots);
+  const slot6 = slots.get(6);
+  const checksum = validateHistoryChecksum(slots, checksumPacket);
+
+  const launches = [];
+  let order = "packet-slot";
+
+  const hasListIndex = slot6 && Number.isInteger(slot6.listIndex) && slot6.listIndex >= 0 && slot6.listIndex < HISTORY_SLOT_COUNT;
+  if (hasListIndex) {
+    order = "newest-first";
+    const total = Math.min(Number(slot6.totalCounter) || 0, HISTORY_SLOT_COUNT);
+    const limit = total > 0 ? total : HISTORY_SLOT_COUNT;
+
+    for (let offset = 0; offset < HISTORY_SLOT_COUNT && launches.length < limit; offset += 1) {
+      const index = (slot6.listIndex - offset + HISTORY_SLOT_COUNT) % HISTORY_SLOT_COUNT;
+      const value = records[index];
+      if (isValidHistoryValue(value)) launches.push(value);
+    }
+  }
+
+  if (!launches.length) {
+    for (const value of records) {
+      if (isValidHistoryValue(value)) launches.push(value);
+    }
+  }
+
+  return {
+    launches,
+    order,
+    totalCounter: slot6?.totalCounter ?? null,
+    listIndex: slot6?.listIndex ?? null,
+    checksum,
+  };
 };
 
 export const mergeCurveSegments = segments => {
-  const points = [];
-  for (let i = 0; i <= 3; i++) {
+  const intervals = [];
+  const rpmApprox = [];
+
+  for (let i = 0; i <= 3; i += 1) {
     const segment = segments.get(i);
     if (!segment) continue;
-    for (const value of segment.points) {
-      if (value > 0) points.push(value);
+
+    for (const value of segment.intervals) {
+      intervals.push(value);
+    }
+    for (const value of segment.rpmApprox) {
+      if (Number.isInteger(value) && value > 0) rpmApprox.push(value);
     }
   }
-  return points;
+
+  return {
+    intervals,
+    rpmApprox,
+  };
 };
 
 export const validateThresholdInput = (lowRaw, highRaw) => {
@@ -136,3 +247,7 @@ export const buildThresholdConfigCommand = (low, high) =>
   new Uint8Array([COMMANDS.PROPOSED_THRESHOLD_CONFIG, low & 0xff, low >> 8, high & 0xff, high >> 8]);
 
 export const buildSensorTestCommand = enabled => new Uint8Array([COMMANDS.PROPOSED_SENSOR_TEST, enabled ? 1 : 0]);
+
+export const isCommandSupported = command => command === COMMANDS.REQUEST_HISTORY;
+
+export const deriveApproxRpmFromInterval = intervalToApproxRpm;
