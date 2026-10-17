@@ -11,7 +11,7 @@ This repository hosts a browser dashboard for the ESP32-S3 Beyblade tachometer
 
 The dashboard shows a clear fallback message if Web Bluetooth is unavailable.
 
-## BLE profile
+## BLE profile (firmware source of truth)
 
 - Device name: `BEYBLADE_TOOL01`
 - Service UUID: `55c40000-f8eb-11ec-b939-0242ac120002`
@@ -19,59 +19,60 @@ The dashboard shows a clear fallback message if Web Bluetooth is unavailable.
 - Write characteristic UUID: `55c4f001-f8eb-11ec-b939-0242ac120002`
 - Packet length: **17 bytes**
 
-## Currently supported packet/command handling
+## Packet layout implemented in the web dashboard
 
-### Incoming notify packets
+### `0xA0` status packet
 
-- `0xA0`: status packet (RPM + battery + launch count)
-- `0xB0`-`0xB7`: launch history slots
-- `0x70`-`0x73`: launch curve segments
-- `0xCF`: command acknowledgement (handled safely as acknowledgement only)
+- `byte[3]`: state code (`0x00` idle/not attached, `0x04` attached, `0x10` on/click state)
+- `byte[4]`: battery raw (`0..250`) -> converted to UI percent (`0..100`)
+- `byte[7..8]`: max shoot power / max RPM (`uint16`, little-endian)
+- `byte[9..10]`: total launches (`uint16`, little-endian)
+- `byte[11..16]`: firmware padding (`0x67`)
 
-### Outgoing write commands used by the dashboard
+`0xA0` does **not** contain latest RPM, peak RPM, or battery voltage fields.
 
-- `0x74`: request launch history refresh
-- `0x75` *(proposed extension)*: sensor test start/stop request
-- `0x76` *(proposed extension)*: threshold configuration request
+### `0xB0..0xB6` history data packets
 
-> Current firmware is known to return acknowledgements for unknown commands.
-> Therefore, `0x75` and `0x76` are treated as **unverified requests** unless a
-> firmware extension is implemented.
+- Seven packets carry a 50-slot circular history.
+- Slots are 16-bit little-endian values.
+- `0xB0..0xB5`: 8 values each.
+- `0xB6`: first 2 values are history values (slots 48-49), and metadata is stored in:
+  - `byte[9..10]`: `totalCounter`
+  - `byte[11]`: `listIndex`
 
-## Firmware extension requirements for requested features
+The dashboard merges all data packets, filters invalid/zero values, and uses
+`listIndex` when available to provide a newest-first view.
 
-The dashboard UI is ready for these features, but firmware support is still
-required to make them fully functional:
+### `0xB7` checksum packet
 
-1. **ITR1113 raw test stream**: send dedicated raw/derived sensor packets while
-   test mode is enabled.
-2. **Threshold persistence**: validate and store threshold values in firmware,
-   then expose read-back/status confirmation.
+- `byte[16]`: low byte checksum.
+- Checksum value equals `sum(bytes[1..16] of packets 0xB0..0xB6) & 0xFF`.
 
-## Proposed backward-compatible protocol extension
+The dashboard treats `0xB7` as checksum-only metadata and validates it when all
+history data packets are present.
 
-To remain compatible with current devices, keep existing packet headers and add
-new optional commands/packets:
+### `0x70..0x73` curve packets
 
-### `0x75` Sensor test control (write)
+- 32 samples total, 16-bit little-endian values.
+- Values are **intervals**, not RPM.
+- Firmware interval formula: `interval = 7500000 / RPM`.
 
-- `0x75 0x01`: start raw sensor test stream
-- `0x75 0x00`: stop raw sensor test stream
+The dashboard stores raw interval samples and also derives approximate RPM for
+charting with defensive zero/range checks.
 
-### `0x76` Threshold configuration (write)
+## Command support
 
-- Payload (little-endian):
-  - byte 0: `0x76`
-  - byte 1-2: low threshold (`uint16`)
-  - byte 3-4: high threshold (`uint16`)
+### Implemented command
 
-### Suggested confirmation packet (notify)
+- `0x74`: request history refresh (`0xB0..0xB7` response)
 
-- Reuse `0xCF` ack with additional status code in unused bytes (or add a new
-  header) to distinguish:
-  - command accepted but unsupported
-  - command accepted and persisted
-  - command rejected (invalid range)
+### Unsupported by current firmware
+
+- `0x75`: sensor test control (UI remains visible but disabled)
+- `0x76`: threshold configuration (UI remains visible but disabled)
+
+Unknown write commands may receive a generic acknowledgement where `ack[0]` is
+the command byte and `ack[1] = 0x01`.
 
 ## Development and testing
 
