@@ -56,6 +56,7 @@ function handlePacket(event) {
       $("sensorState").textContent = ["WHITE", "MID", "BLACK"][d[3]] || "-";
       $("sensorBar").style.width = `${Math.min(100, u16(d, 1) / 4095 * 100)}%`;
       $("thresholdValues").textContent = `${u16(d, 6)} - ${u16(d, 4)}`;
+      $("sensorHint").textContent = `Live ADC: ${u16(d, 1)} | thresholds: ${u16(d, 6)} - ${u16(d, 4)}`;
       break;
     case 0xB0: case 0xB1: case 0xB2: case 0xB3: case 0xB4: case 0xB5: case 0xB6:
       historyPackets.set(d[0], d); renderHistory(); break;
@@ -78,7 +79,7 @@ async function refresh() {
   try {
     await write([0xC0]);
     await write([0xC1]);
-    await write([0xC2]);
+    if ($("sensorTest").checked) await write([0xC2]);
   } finally {
     pollBusy = false;
   }
@@ -116,6 +117,9 @@ function disconnect() {
 async function saveSettings() {
   await write([0xC4, +$("high").value, +$("low").value, $("batteryDisplay").checked ? 1 : 0, $("sensorTest").checked ? 1 : 0]);
   await write([0xC1]);
+  $("sensorHint").textContent = $("sensorTest").checked
+    ? "Sensor stream enabled; move the ITR1113 over the target."
+    : "Enable sensor test to stream ADC readings from the ESP32.";
   message("Settings saved");
 }
 
