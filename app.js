@@ -79,7 +79,6 @@ async function refresh() {
   try {
     await write([0xC0]);
     await write([0xC1]);
-    if ($("sensorTest").checked) await write([0xC2]);
   } finally {
     pollBusy = false;
   }
@@ -141,3 +140,8 @@ $("low").oninput = e => $("lowOutput").textContent = `${e.target.value}%`;
 setInterval(() => {
   if (writeCharacteristic) refresh().catch(e => message(`Refresh failed: ${e.message}`, true));
 }, 1000);
+setInterval(() => {
+  if (writeCharacteristic) {
+    write([0xC2]).catch(e => message(`Sensor read failed: ${e.message}`, true));
+  }
+}, 250);
