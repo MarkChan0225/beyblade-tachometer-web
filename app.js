@@ -4,9 +4,14 @@ import {
   BLE_SERVICE_UUID,
   BLE_WRITE_UUID,
   COMMANDS,
+  RESULT_CODES,
+  buildReadConfigCommand,
+  buildSensorTestCommand,
+  buildThresholdConfigCommand,
   mergeCurveSegments,
   mergeHistorySlots,
   parsePacket,
+  validateThresholdInput,
 } from "./protocol.mjs";
 
 const BATTERY_VISIBILITY_KEY = "tachometer.showBattery";
@@ -32,6 +37,14 @@ const state = {
   curveApproxRpm: [],
   sensorTestRunning: false,
   batteryVisible: true,
+  firmware: {
+    supportsExtended: false,
+    sensorTest: false,
+    thresholdConfig: false,
+    sensorTestRunning: false,
+    lowThreshold: null,
+    highThreshold: null,
+  },
 };
 
 const ui = {
@@ -73,14 +86,64 @@ const setStateChip = text => {
   ui.statusChip.textContent = text;
 };
 
+const resetFirmwareCapabilities = () => {
+  state.firmware.supportsExtended = false;
+  state.firmware.sensorTest = false;
+  state.firmware.thresholdConfig = false;
+  state.firmware.sensorTestRunning = false;
+  state.firmware.lowThreshold = null;
+  state.firmware.highThreshold = null;
+};
+
+const applyFirmwareControls = () => {
+  const connected = !!state.writeCharacteristic;
+  const sensorSupported = connected && state.firmware.sensorTest;
+  const thresholdSupported = connected && state.firmware.thresholdConfig;
+
+  ui.startSensorTest.disabled = !sensorSupported || state.firmware.sensorTestRunning;
+  ui.stopSensorTest.disabled = !sensorSupported || !state.firmware.sensorTestRunning;
+  ui.applyThresholds.disabled = !thresholdSupported;
+
+  ui.startSensorTest.textContent = sensorSupported ? "Start sensor test (0x75)" : "Unsupported (0x75)";
+  ui.stopSensorTest.textContent = sensorSupported ? "Stop sensor test" : "Unsupported";
+  ui.applyThresholds.textContent = thresholdSupported ? "Apply thresholds (0x76)" : "Unsupported (0x76)";
+};
+
+const applyConfigAck = parsed => {
+  state.firmware.supportsExtended = true;
+  state.firmware.sensorTest = parsed.capabilities.sensorTest;
+  state.firmware.thresholdConfig = parsed.capabilities.thresholdConfig;
+  state.firmware.sensorTestRunning = parsed.capabilities.sensorTestRunning;
+  state.firmware.lowThreshold = parsed.lowThreshold;
+  state.firmware.highThreshold = parsed.highThreshold;
+  state.sensorTestRunning = parsed.capabilities.sensorTestRunning;
+
+  ui.lowThreshold.value = String(parsed.lowThreshold);
+  ui.highThreshold.value = String(parsed.highThreshold);
+
+  ui.sensorStatus.textContent = parsed.capabilities.sensorTestRunning
+    ? `Sensor test streaming (seq ${parsed.sequence}).`
+    : "Sensor test idle.";
+
+  if (parsed.capabilities.thresholdConfig) {
+    ui.thresholdMessage.textContent = `Active thresholds: low=${parsed.lowThreshold}, high=${parsed.highThreshold}.`;
+  } else {
+    ui.thresholdMessage.textContent = "Connected firmware does not support threshold configuration.";
+  }
+
+  applyFirmwareControls();
+};
+
+const requestFirmwareConfig = async () => {
+  await enqueueWrite(buildReadConfigCommand());
+};
+
 const toggleConnectedUi = connected => {
   ui.connect.disabled = connected;
   ui.disconnect.disabled = !connected;
   ui.refreshHistory.disabled = !connected;
   ui.clearHistory.disabled = !connected;
-  ui.startSensorTest.disabled = true;
-  ui.stopSensorTest.disabled = true;
-  ui.applyThresholds.disabled = true;
+  applyFirmwareControls();
 };
 
 const resetTelemetry = () => {
@@ -235,8 +298,48 @@ function handlePacket(event) {
   }
 
   if (parsed.kind === "ack") {
-    if (parsed.command === COMMANDS.PROPOSED_THRESHOLD_CONFIG || parsed.command === COMMANDS.PROPOSED_SENSOR_TEST) {
-      setMessage("Firmware acknowledged an unsupported extension command (0x75/0x76). This dashboard keeps these controls disabled.");
+    if (
+      parsed.command === COMMANDS.SENSOR_TEST ||
+      parsed.command === COMMANDS.THRESHOLD_CONFIG ||
+      parsed.command === COMMANDS.READ_CONFIG
+    ) {
+      setMessage("Connected firmware only returned legacy ACK for extension command. Sensor/threshold features remain disabled.");
+      if (!state.firmware.supportsExtended) {
+        ui.sensorStatus.textContent = "Connected firmware does not support sensor-test extension packets.";
+        ui.thresholdMessage.textContent = "Connected firmware does not support threshold extension packets.";
+      }
+      applyFirmwareControls();
+    }
+    return;
+  }
+
+  if (parsed.kind === "configAck") {
+    applyConfigAck(parsed);
+
+    if (parsed.resultCode === RESULT_CODES.ACCEPTED || parsed.resultCode === RESULT_CODES.ACCEPTED_PERSISTED) {
+      if (parsed.command === COMMANDS.THRESHOLD_CONFIG) {
+        ui.thresholdMessage.textContent = parsed.persisted
+          ? `Thresholds saved: low=${parsed.lowThreshold}, high=${parsed.highThreshold}.`
+          : `Thresholds applied (not persisted): low=${parsed.lowThreshold}, high=${parsed.highThreshold}.`;
+      }
+      setMessage(`Firmware accepted 0x${parsed.command.toString(16)} configuration update.`);
+      return;
+    }
+
+    if (parsed.resultCode === RESULT_CODES.INVALID_VALUE) {
+      if (parsed.command === COMMANDS.THRESHOLD_CONFIG) {
+        ui.thresholdMessage.textContent = "Firmware rejected thresholds: value range invalid.";
+      }
+      setMessage(`Firmware rejected 0x${parsed.command.toString(16)} command: invalid value.`, true);
+      return;
+    }
+    if (parsed.resultCode === RESULT_CODES.UNSUPPORTED) {
+      setMessage(`Firmware reported command 0x${parsed.command.toString(16)} unsupported.`, true);
+      return;
+    }
+    if (parsed.resultCode === RESULT_CODES.MALFORMED) {
+      setMessage(`Firmware rejected malformed command 0x${parsed.command.toString(16)}.`, true);
+      return;
     }
     return;
   }
@@ -284,6 +387,14 @@ function handlePacket(event) {
     state.curveIntervals = merged.intervals;
     state.curveApproxRpm = merged.rpmApprox;
     renderCurve();
+    return;
+  }
+
+  if (parsed.kind === "sensorRaw") {
+    const color = parsed.blackState ? "black" : "white";
+    ui.sensorRaw.textContent =
+      `ADC=${parsed.rawAdc} · threshold low/high=${parsed.lowThreshold}/${parsed.highThreshold} · state=${color} · seq=${parsed.sampleSequence}`;
+    ui.sensorStatus.textContent = parsed.running ? "Sensor test streaming." : "Sensor test idle.";
   }
 }
 
